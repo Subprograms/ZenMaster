@@ -26,40 +26,50 @@ tBasicAuth      = (f"{sAgentEmail}/token", sApiToken)
 dMe   = requests.get(f"{sZendeskBaseUrl}/api/v2/users/me.json", auth=tBasicAuth).json()
 nMyId = dMe["user"]["id"]
 
-# Ticket pages traversal in Zendesk
-def harvestTickets(sStartUrl):
+# Ticket collectors that tag each ticket with its role (assigned / cc / follower / requester)
+def harvestTickets(sRoleLabel, sStartUrl):
     sPage = sStartUrl
     while sPage:
-        oPageResponse = requests.get(sPage, auth=tBasicAuth)
-        oPageResponse.raise_for_status() # quit upon HTTP error
-        dPagePayload = oPageResponse.json()
-        aTicketList.extend(dPagePayload.get("tickets", [])) # stash the page
-        sPage = dPagePayload.get("links", {}).get("next") # next page or None from Zendesk
+        dJ = requests.get(sPage, auth=tBasicAuth).json()
+        for dT in dJ.get("tickets", []):
+            dT["_role"] = sRoleLabel # stamp the role (internal only)
+            aTicketList.append(dT)
+        sPage = dJ.get("links", {}).get("next")
 
-def harvestSearch(sQuery):
+def harvestSearch(sRoleLabel, sQuery):
     sPage = f"{sZendeskBaseUrl}/api/v2/search.json?query={sQuery}&per_page=100"
     while sPage:
-        dPayload = requests.get(sPage, auth=tBasicAuth).json()
-        aTicketList.extend([dHit for dHit in dPayload.get("results", []) if dHit.get("result_type")=="ticket"])
-        sPage = dPayload.get("next_page")
+        dJ = requests.get(sPage, auth=tBasicAuth).json()
+        for dHit in dJ.get("results", []):
+            if dHit.get("result_type") == "ticket":
+                dHit["_role"] = sRoleLabel # stamp the role (internal only)
+                aTicketList.append(dHit)
+        sPage = dJ.get("next_page")
 
 aTicketList = []
-harvestTickets(f"{sZendeskBaseUrl}/api/v2/tickets.json?page[size]=100") # Assigned tickets
-harvestSearch(f"type:ticket+cc:{nMyId}") # CC'ed tickets
-harvestSearch(f"type:ticket+follower:{nMyId}") # Followed tickets
+harvestTickets("assigned",  f"{sZendeskBaseUrl}/api/v2/tickets.json?page[size]=100")
+harvestSearch("cc",        f"type:ticket+cc:{nMyId}")
+harvestSearch("follower",  f"type:ticket+follower:{nMyId}")
+harvestSearch("requester", f"type:ticket+requester:{nMyId}")
+
+aTicketList.sort(key=lambda d: d.get("id", 0)) # sort ascending by ID
 
 def cellValue(vRaw):
     if vRaw is None:
         return ""
     if isinstance(vRaw, (dict, list)):
-        return json.dumps(vRaw, ensure_ascii=False) # JSON stays JSON, if any
+        return json.dumps(vRaw, ensure_ascii=False) # JSON stays JSON
     if isinstance(vRaw, str):
         return vRaw.replace("\r", " ").replace("\n", " ")
-    return vRaw # numbers, bools untouched
+    return vRaw # numbers / bools untouched
 
-# work out every column we’ve seen so no field gets lost
-aColumnNames = sorted({sKey for dTicket in aTicketList for sKey in dTicket.keys()})
-sFileStamp   = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S") # Timestamped filenames
+# work out columns, put id first
+aColumnNames = sorted({k for dT in aTicketList for k in dT.keys() if not k.startswith("_")}) # skip _role
+if "id" in aColumnNames:
+    aColumnNames.remove("id")
+aColumnNames.insert(0, "id") # left-most id
+
+sFileStamp = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
 
 # CSV for ingestion by Power BI
 sCsvFileName = f"zendesk_tickets_{sFileStamp}.csv"
@@ -69,71 +79,69 @@ with open(sCsvFileName, "w", newline="", encoding="utf-8-sig") as hCsv:
         fieldnames=aColumnNames,
         extrasaction="ignore",
         quoting=csv.QUOTE_ALL,
-        lineterminator="\r\n"
+        lineterminator="\r\n",
     )
     oCsvWriter.writeheader()
-    for dTicket in aTicketList:
-        oCsvWriter.writerow({sCol: cellValue(dTicket.get(sCol)) for sCol in aColumnNames})
+    for dT in aTicketList:
+        oCsvWriter.writerow({k: cellValue(dT.get(k)) for k in aColumnNames})
 
-# Optional XLSX for review, formatted as opposed to the raw CSV
+# Optional XLSX for formatted tickets as tables
 bMakeWorkbook = input("Save formatted Excel workbook? (y/n): ").strip().lower() == "y"
 sWorkbookName = None
 if bMakeWorkbook:
     try:
         import xlsxwriter
     except ImportError:
-        print("xlsxwriter not installed, skipping workbook generation.")
+        print("xlsxwriter not installed, skipping workbook.")
     else:
         sWorkbookName = f"zendesk_tickets_{sFileStamp}_formatted.xlsx"
         oWb = xlsxwriter.Workbook(sWorkbookName, {"constant_memory": True})
         oWs = oWb.add_worksheet("tickets")
 
-        oFmtSection = oWb.add_format({"bold": True, "align": "center", "valign": "vcenter",
-                                      "bg_color": "#BDD7EE"})
-        oFmtHead = oWb.add_format({"bold": True, "border": 1, "text_wrap": True,
-                                   "align": "center", "valign": "vcenter",
-                                   "bg_color": "#D9E1F2"})
-        oFmtField = oWb.add_format({"border": 1, "text_wrap": True,
-                                    "align": "center", "valign": "vcenter"})
-        oFmtValue = oWb.add_format({"border": 1, "text_wrap": True,
-                                    "align": "left",   "valign": "vcenter"})
+        oFmtSection = oWb.add_format({"bold": True, "align": "center", "valign": "vcenter", "bg_color": "#BDD7EE"})
+        oFmtHead   = oWb.add_format({"bold": True, "border": 1, "text_wrap": True, "align": "center", "valign": "vcenter", "bg_color": "#D9E1F2"})
+        oFmtField  = oWb.add_format({"border": 1, "text_wrap": True, "align": "center", "valign": "vcenter"})
+        oFmtValue  = oWb.add_format({"border": 1, "text_wrap": True, "align": "left", "valign": "vcenter"})
 
-        nRowCursor = 0
-        for dTicket in aTicketList:
-            nTicketId = dTicket.get("id", "UNKNOWN")
-            oWs.merge_range(nRowCursor, 0, nRowCursor, 1,
-                            f"Ticket ID {nTicketId}", oFmtSection)
-            oWs.set_row(nRowCursor, 20)
-            nRowCursor += 1
+        nRow = 0
+        for dT in aTicketList:
+            nTicketId = dT.get("id", "UNKNOWN")
+            sRole     = dT.get("_role", "unknown").upper()
+            oWs.merge_range(nRow, 0, nRow, 1, f"{sRole} – Ticket {nTicketId}", oFmtSection)
+            oWs.set_row(nRow, 20)
+            nRow += 1
 
-            oWs.write(nRowCursor, 0, "Ticket Field", oFmtHead)
-            oWs.write(nRowCursor, 1, "Value",        oFmtHead)
-            oWs.set_row(nRowCursor, 22)
-            nRowCursor += 1
+            oWs.write(nRow, 0, "Ticket Field", oFmtHead)
+            oWs.write(nRow, 1, "Value",        oFmtHead)
+            oWs.set_row(nRow, 22)
+            nRow += 1
 
-            for sField in aColumnNames:
-                oWs.write(nRowCursor, 0, sField, oFmtField)
-                oWs.write(nRowCursor, 1, cellValue(dTicket.get(sField)), oFmtValue)
-                oWs.set_row(nRowCursor, 35)
-                nRowCursor += 1
+            for k in aColumnNames:
+                oWs.write(nRow, 0, k,               oFmtField)
+                oWs.write(nRow, 1, cellValue(dT.get(k)), oFmtValue)
+                oWs.set_row(nRow, 35)
+                nRow += 1
 
-            nRowCursor += 3  # Padding between tables for each ticket
+            nRow += 3 # gap before next ticket
 
         oWs.set_column(0, 0, 30,  oFmtField)
         oWs.set_column(1, 1, 100, oFmtValue)
         oWb.close()
 
+# dump per-ticket variables
 sEnvFileName = f"zendesk_tickets_{sFileStamp}.env"
 with open(sEnvFileName, "w", encoding="utf-8") as hEnv:
-    for dTicket in aTicketList:
-        nTicketId = dTicket.get("id")
-        if nTicketId is None:
+    for dT in aTicketList:
+        nId = dT.get("id")
+        if nId is None:
             continue
-        for sField, vVal in dTicket.items():
-            sEnvVar = f'TICKET_{nTicketId}_{re.sub(r"[^A-Za-z0-9]", "_", sField).upper()}'
-            hEnv.write(f'{sEnvVar}="{cellValue(vVal)}"\n')
+        for k, v in dT.items():
+            if k.startswith("_"): # skip internal _role
+                continue
+            sEnvVar = f'TICKET_{nId}_{re.sub(r"[^A-Za-z0-9]", "_", k).upper()}'
+            hEnv.write(f'{sEnvVar}="{cellValue(v)}"\n')
 
 print(f"Wrote {len(aTicketList)} tickets -> {sCsvFileName}")
-if sWorkbookName:
+if bMakeWorkbook:
     print(f"Wrote formatted workbook -> {sWorkbookName}")
 print(f"Wrote ticket-variable file -> {sEnvFileName}")
