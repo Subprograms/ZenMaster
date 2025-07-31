@@ -21,17 +21,32 @@ while True:
 
 # Build the base URL and authenticate once, used upon every call
 sZendeskBaseUrl = f"https://{sZendeskSubdomain}.zendesk.com"
-sNextPageUrl    = f"{sZendeskBaseUrl}/api/v2/tickets.json?page[size]=100"
 tBasicAuth      = (f"{sAgentEmail}/token", sApiToken)
 
+dMe   = requests.get(f"{sZendeskBaseUrl}/api/v2/users/me.json", auth=tBasicAuth).json()
+nMyId = dMe["user"]["id"]
+
 # Ticket pages traversal in Zendesk
+def harvestTickets(sStartUrl):
+    sPage = sStartUrl
+    while sPage:
+        oPageResponse = requests.get(sPage, auth=tBasicAuth)
+        oPageResponse.raise_for_status() # quit upon HTTP error
+        dPagePayload = oPageResponse.json()
+        aTicketList.extend(dPagePayload.get("tickets", [])) # stash the page
+        sPage = dPagePayload.get("links", {}).get("next") # next page or None from Zendesk
+
+def harvestSearch(sQuery):
+    sPage = f"{sZendeskBaseUrl}/api/v2/search.json?query={sQuery}&per_page=100"
+    while sPage:
+        dPayload = requests.get(sPage, auth=tBasicAuth).json()
+        aTicketList.extend([dHit for dHit in dPayload.get("results", []) if dHit.get("result_type")=="ticket"])
+        sPage = dPayload.get("next_page")
+
 aTicketList = []
-while sNextPageUrl:
-    oPageResponse = requests.get(sNextPageUrl, auth=tBasicAuth)
-    oPageResponse.raise_for_status() # quit upon HTTP error
-    dPagePayload = oPageResponse.json()
-    aTicketList.extend(dPagePayload.get("tickets", [])) # stash the page
-    sNextPageUrl = dPagePayload.get("links", {}).get("next") # next page or None from Zendesk
+harvestTickets(f"{sZendeskBaseUrl}/api/v2/tickets.json?page[size]=100") # Assigned tickets
+harvestSearch(f"type:ticket+cc:{nMyId}") # CC'ed tickets
+harvestSearch(f"type:ticket+follower:{nMyId}") # Followed tickets
 
 def cellValue(vRaw):
     if vRaw is None:
@@ -39,12 +54,12 @@ def cellValue(vRaw):
     if isinstance(vRaw, (dict, list)):
         return json.dumps(vRaw, ensure_ascii=False) # JSON stays JSON, if any
     if isinstance(vRaw, str):
-        return vRaw.replace("\r", " ").replace("\n", " ") # kill line-feeds for tidy display
+        return vRaw.replace("\r", " ").replace("\n", " ")
     return vRaw # numbers, bools untouched
 
 # work out every column we’ve seen so no field gets lost
 aColumnNames = sorted({sKey for dTicket in aTicketList for sKey in dTicket.keys()})
-sFileStamp   = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S") # timestamped filenames
+sFileStamp   = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S") # Timestamped filenames
 
 # CSV for ingestion by Power BI
 sCsvFileName = f"zendesk_tickets_{sFileStamp}.csv"
@@ -86,20 +101,16 @@ if bMakeWorkbook:
         nRowCursor = 0
         for dTicket in aTicketList:
             nTicketId = dTicket.get("id", "UNKNOWN")
-
-            # Ticket Title
             oWs.merge_range(nRowCursor, 0, nRowCursor, 1,
                             f"Ticket ID {nTicketId}", oFmtSection)
             oWs.set_row(nRowCursor, 20)
             nRowCursor += 1
 
-            # Header rows for Ticket Field and its Value
             oWs.write(nRowCursor, 0, "Ticket Field", oFmtHead)
             oWs.write(nRowCursor, 1, "Value",        oFmtHead)
             oWs.set_row(nRowCursor, 22)
             nRowCursor += 1
 
-            # Details
             for sField in aColumnNames:
                 oWs.write(nRowCursor, 0, sField, oFmtField)
                 oWs.write(nRowCursor, 1, cellValue(dTicket.get(sField)), oFmtValue)
