@@ -46,9 +46,7 @@ def harvestSearch(sRoleLabel, sQuery):
                 aTicketList.append(dHit)
         sPage = dJ.get("next_page")
 
-# -----------------------------
 # Filtering Options
-# -----------------------------
 org_filter = None
 time_start_filter = None
 time_end_filter = None
@@ -65,9 +63,7 @@ def apply_filters(tickets):
         filtered = [t for t in filtered if "created_at" in t and date_start_filter <= t["created_at"].split("T")[0] <= date_end_filter]
     return filtered
 
-# -----------------------------
 # Main Menu Loop
-# -----------------------------
 while True:
     print("\nMain Menu:")
     print("1. Filter by Organization")
@@ -216,3 +212,4 @@ print(f"Wrote {len(aTicketList)} tickets -> {sCsvFileName}")
 if bMakeWorkbook:
     print(f"Wrote formatted workbook -> {sWorkbookName}")
 print(f"Wrote ticket-variable file -> {sEnvFileName}")
+
