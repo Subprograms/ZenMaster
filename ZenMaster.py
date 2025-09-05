@@ -46,6 +46,74 @@ def harvestSearch(sRoleLabel, sQuery):
                 aTicketList.append(dHit)
         sPage = dJ.get("next_page")
 
+# -----------------------------
+# Filtering Options
+# -----------------------------
+org_filter = None
+time_start_filter = None
+time_end_filter = None
+date_start_filter = None
+date_end_filter = None
+
+def apply_filters(tickets):
+    filtered = tickets
+    if org_filter:
+        filtered = [t for t in filtered if str(t.get("organization_id")) == org_filter]
+    if time_start_filter and time_end_filter:
+        filtered = [t for t in filtered if "created_at" in t and time_start_filter <= t["created_at"].split("T")[1] <= time_end_filter]
+    if date_start_filter and date_end_filter:
+        filtered = [t for t in filtered if "created_at" in t and date_start_filter <= t["created_at"].split("T")[0] <= date_end_filter]
+    return filtered
+
+# -----------------------------
+# Main Menu Loop
+# -----------------------------
+while True:
+    print("\nMain Menu:")
+    print("1. Filter by Organization")
+    print("2. Filter by Time Range (created_at, time only, format HH:MM:SSZ)")
+    print("3. Filter by Created_at Date Range (format YYYY-MM-DD)")
+    print("4. Proceed with Retrieval")
+    print("5. Exit")
+
+    choice = input("Select an option: ").strip()
+
+    if choice == "1":
+        while True:
+            org_input = input("Enter 14-digit Organization ID: ").strip()
+            if re.fullmatch(r"\d{14}", org_input):
+                org_filter = org_input
+                print(f"Organization filter set to {org_filter}")
+                break
+            else:
+                print("Invalid Organization ID, must be 14 digits.")
+    elif choice == "2":
+        while True:
+            start = input("Start time (HH:MM:SSZ): ").strip()
+            end = input("End time (HH:MM:SSZ): ").strip()
+            if re.fullmatch(r"\d{2}:\d{2}:\d{2}Z", start) and re.fullmatch(r"\d{2}:\d{2}:\d{2}Z", end):
+                time_start_filter, time_end_filter = start, end
+                print(f"Time range filter set from {time_start_filter} to {time_end_filter}")
+                break
+            else:
+                print("Invalid time format, must match HH:MM:SSZ (example: 02:52:31Z).")
+    elif choice == "3":
+        while True:
+            start = input("Start date (YYYY-MM-DD): ").strip()
+            end = input("End date (YYYY-MM-DD): ").strip()
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", start) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", end):
+                date_start_filter, date_end_filter = start, end
+                print(f"Date range filter set from {date_start_filter} to {date_end_filter}")
+                break
+            else:
+                print("Invalid date format, must match YYYY-MM-DD (example: 2025-07-31).")
+    elif choice == "4":
+        break
+    elif choice == "5":
+        sys.exit(0)
+    else:
+        print("Invalid choice, please try again.")
+
 aTicketList = []
 harvestTickets("assigned",  f"{sZendeskBaseUrl}/api/v2/tickets.json?page[size]=100")
 harvestSearch("cc",        f"type:ticket+cc:{nMyId}")
@@ -53,6 +121,9 @@ harvestSearch("follower",  f"type:ticket+follower:{nMyId}")
 harvestSearch("requester", f"type:ticket+requester:{nMyId}")
 
 aTicketList.sort(key=lambda d: d.get("id", 0)) # sort ascending by ID
+
+# Apply filters here
+aTicketList = apply_filters(aTicketList)
 
 def cellValue(vRaw):
     if vRaw is None:
