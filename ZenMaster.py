@@ -457,118 +457,250 @@ aAtoms = []
 # -----------------------------
 # Main Menu Loop
 # -----------------------------
+def isValidIPv4(sVal):
+    return isinstance(sVal, str) and re.fullmatch(r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}", sVal) is not None
+
+def isValidHash(sVal):
+    return isinstance(sVal, str) and re.fullmatch(r"(?i)^[a-f0-9]{32}$|^[a-f0-9]{40}$|^[a-f0-9]{64}$", sVal) is not None
+
+def isValidToken(sVal):
+    return isinstance(sVal, str) and 1 <= len(sVal) <= 100
+
+def customVal(dT, nId):
+    try:
+        for cf in dT.get("custom_fields", []):
+            if int(cf.get("id") or 0) == int(nId):
+                return cf.get("value")
+    except Exception:
+        return None
+    return None
+
+FIELD_IDS = {
+    "Analyst": int(float("9.00003E+11")),
+    "SeverityImpact": int(float("9.00006E+11")),
+    "Site": int(float("1.9E+12")),
+    "Classification": int(float("9E+11")),
+    "SubClass": int(float("1.9E+12")),
+    "DetectionThreatName": int(float("9.00013E+11")),
+    "Username": int(float("1.9E+12")),
+    "SourceIp": int(float("1.9E+12")),
+    "DestinationIp": int(float("9.00012E+11")),
+    "FileHash": int(float("1.9E+12")),
+    "UrlWebsite": int(float("9.00013E+11")),
+    "AnalystNotes": int(float("9.00012E+11")),
+    "InitialResponseTime": int(float("9.00012E+11")),
+    "RecommendationTime": int(float("9.00012E+11")),
+}
+
+def compileTokenExpr(sInput):
+    return compileExpr(sInput, isValidToken, "Invalid value in expression.", bLower=True)
+
+def compileIPv4Expr(sInput):
+    return compileExpr(sInput, isValidIPv4, "Invalid IPv4 address in expression.", bLower=False)
+
+def compileHashExpr(sInput):
+    return compileExpr(sInput, isValidHash, "Invalid hash in expression. Use MD5/SHA1/SHA256 hex.", bLower=True)
+
+def dtFromString_Ymd12h(sVal):
+    try:
+        return datetime.datetime.strptime(sVal, "%Y/%m/%d %I:%M %p")
+    except Exception:
+        return None
+
+def addDropdownAtom(sLabel, nFieldId, sPrompt):
+    sInput = input(sPrompt).strip()
+    tExpr = compileTokenExpr(sInput)
+    if tExpr is None:
+        return
+    sExpr, aRpn = tExpr
+    def fPred(dT, a=aRpn, nid=nFieldId):
+        v = str(customVal(dT, nid) or "").lower()
+        return evalRpn(a, lambda tok: v == tok)
+    addAtomWithMerge(sLabel, "(" + sExpr + ")", fPred)
+
+def addContainsAtom(sLabel, nFieldId, sPrompt):
+    sInput = input(sPrompt).strip()
+    tExpr = compileExpr(sInput, isValidDescription, "Invalid value in expression. Each must be 1-200 characters.", bLower=True)
+    if tExpr is None:
+        return
+    sExpr, aRpn = tExpr
+    def fPred(dT, a=aRpn, nid=nFieldId):
+        v = str(customVal(dT, nid) or "").lower()
+        return evalRpn(a, lambda tok: tok in v)
+    addAtomWithMerge(sLabel, "(" + sExpr + ")", fPred)
+
+def addIPv4Atom(sLabel, nFieldId, sPrompt):
+    sInput = input(sPrompt).strip()
+    tExpr = compileIPv4Expr(sInput)
+    if tExpr is None:
+        return
+    sExpr, aRpn = tExpr
+    def fPred(dT, a=aRpn, nid=nFieldId):
+        v = str(customVal(dT, nid) or "")
+        return evalRpn(a, lambda tok: v == tok)
+    addAtomWithMerge(sLabel, "(" + sExpr + ")", fPred)
+
+def addHashAtom(sLabel, nFieldId, sPrompt):
+    sInput = input(sPrompt).strip()
+    tExpr = compileHashExpr(sInput)
+    if tExpr is None:
+        return
+    sExpr, aRpn = tExpr
+    def fPred(dT, a=aRpn, nid=nFieldId):
+        v = str(customVal(dT, nid) or "").lower()
+        return evalRpn(a, lambda tok: v == tok)
+    addAtomWithMerge(sLabel, "(" + sExpr + ")", fPred)
+
+def addTagsAtom():
+    sInput = input("tags expression (e.g., (phishing OR malware) AND vip): ").strip()
+    tExpr = compileTokenExpr(sInput)
+    if tExpr is None:
+        return
+    sExpr, aRpn = tExpr
+    def fPred(dT, a=aRpn):
+        aTags = [str(t).lower() for t in (dT.get("tags") or [])]
+        return evalRpn(a, lambda tok: tok in aTags)
+    addAtomWithMerge("Tags filter", "(" + sExpr + ")", fPred)
+
+def addStdStatusAtom():
+    sInput = input("status expression (new|open|pending|hold|solved|closed; e.g., open OR pending): ").strip()
+    tExpr = compileExpr(sInput, isValidStatus, "Invalid status in expression.", bLower=True)
+    mergeExpr(aStatusExprs, tExpr, "Status filter", "status")
+
+def addStdTypeAtom():
+    sInput = input("type expression (e.g., incident OR problem OR task OR question): ").strip()
+    tExpr = compileTokenExpr(sInput)
+    if tExpr is None:
+        return
+    sExpr, aRpn = tExpr
+    def fPred(dT, a=aRpn):
+        return evalRpn(a, lambda tok: str(dT.get("type") or "").lower() == tok)
+    addAtomWithMerge("Type filter", "(" + sExpr + ")", fPred)
+
+def addStdAssigneeAtom():
+    sInput = input("assignee_id expression (digits; e.g., 12345 OR 67890): ").strip()
+    tExpr = compileExpr(sInput, isValidId, "Invalid assignee_id in expression. Use digits only.", bLower=False)
+    if tExpr is None:
+        return
+    sExpr, aRpn = tExpr
+    def fPred(dT, a=aRpn):
+        return evalRpn(a, lambda tok: str(dT.get("assignee_id") or "") == tok)
+    addAtomWithMerge("Assignee ID filter", "(" + sExpr + ")", fPred)
+
+def addStdGroupAtom():
+    sInput = input("group_id expression (digits; e.g., 111 OR 222): ").strip()
+    tExpr = compileExpr(sInput, isValidId, "Invalid group_id in expression. Use digits only.", bLower=False)
+    if tExpr is None:
+        return
+    sExpr, aRpn = tExpr
+    def fPred(dT, a=aRpn):
+        return evalRpn(a, lambda tok: str(dT.get("group_id") or "") == tok)
+    addAtomWithMerge("Group ID filter", "(" + sExpr + ")", fPred)
+
+def addStdSubjectAtom():
+    sInput = input("subject expression (contains; e.g., (urgent OR escalation) AND outage): ").strip()
+    tExpr = compileExpr(sInput, isValidSubject, "Invalid subject value in expression. Each must be 1-200 characters.", bLower=True)
+    mergeExpr(aSubjectExprs, tExpr, "Subject filter", "subject")
+
+def addStdDescriptionAtom():
+    sInput = input("description expression (contains; e.g., (error OR failure) AND timeout): ").strip()
+    tExpr = compileExpr(sInput, isValidDescription, "Invalid description value in expression. Each must be 1-200 characters.", bLower=True)
+    mergeExpr(aDescriptionExprs, tExpr, "Description filter", "description")
+
+def addDateTimeRangeAtom(sLabel, nFieldId):
+    while True:
+        sStart = input("Start (YYYY/MM/DD HH:MM AM/PM): ").strip()
+        sEnd   = input("End   (YYYY/MM/DD HH:MM AM/PM): ").strip()
+        if not (re.fullmatch(r"\d{4}/\d{2}/\d{2}\s\d{2}:\d{2}\s(?:AM|PM)", sStart) and re.fullmatch(r"\d{4}/\d{2}/\d{2}\s\d{2}:\d{2}\s(?:AM|PM)", sEnd)):
+            print("Invalid datetime format, must match YYYY/MM/DD HH:MM AM/PM (example: 2025/09/10 07:45 PM).")
+            continue
+        oStart = dtFromString_Ymd12h(sStart)
+        oEnd   = dtFromString_Ymd12h(sEnd)
+        if not oStart or not oEnd or oStart > oEnd:
+            print("Start must be <= End.")
+            continue
+        break
+    def fPred(dT, nid=nFieldId, aStart=oStart, aEnd=oEnd):
+        sVal = str(customVal(dT, nid) or "")
+        oVal = dtFromString_Ymd12h(sVal)
+        if not oVal:
+            return False
+        return aStart <= oVal <= aEnd
+    addAtomWithMerge(sLabel, f'({sLabel} between "{sStart}" and "{sEnd}")', fPred)
+
 while True:
     print("")
     print("Main Menu")
-    print("1.  Filter by Organization")
-    print("2.  Filter by Recipient")
-    print("3.  Filter by Requester ID")
-    print("4.  Filter by Submitter ID")
+    print("1.  Filter by Analyst (drop-down exact match)")
+    print("2.  Filter by Assignee ID")
+    print("3.  Filter by Group ID")
+    print("4.  Filter by Severity/Impact (drop-down)")
     print("5.  Filter by Status")
-    print("6.  Filter by Result Type")
-    print("7.  Filter by Subject")
-    print("8.  Filter by Description")
-    print("9.  Filter by Created_at Date Range (format YYYY-MM-DD)")
-    print("10. Filter by Created_at Time Range (format HH:MM:SSZ)")
-    print("11. Filter by Updated_at Date Range (format YYYY-MM-DD)")
-    print("12. Filter by Updated_at Time Range (format HH:MM:SSZ)")
-    print("13. Filter by Due_at Date Range (format YYYY-MM-DD)")
-    print("14. Filter by Due_at Time Range (format HH:MM:SSZ)")
-    print("15. Show Current Filter Proposition")
-    print("16. Proceed with Retrieval")
+    print("6.  Filter by Tags")
+    print("7.  Filter by Type (ticket type)")
+    print("8.  Filter by Site (drop-down)")
+    print("9.  Filter by Classification/Sub-Class (drop-down)")
+    print("10. Filter by Detection/Threat Name (contains)")
+    print("11. Filter by Username (contains)")
+    print("12. Filter by Source IP Address (IPv4)")
+    print("13. Filter by Destination IP Address (IPv4)")
+    print("14. Filter by File Hash (MD5/SHA1/SHA256)")
+    print("15. Filter by URL/Website (contains)")
+    print("16. Filter by Subject (contains)")
+    print("17. Filter by Description (contains)")
+    print("18. Filter by Analyst Notes (contains)")
+    print("19. Filter by Initial Response Time range (YYYY/MM/DD HH:MM AM/PM)")
+    print("20. Filter by Recommendation Time range (YYYY/MM/DD HH:MM AM/PM)")
+    print("21. Show Current Filter Proposition")
+    print("22. Proceed with Retrieval")
     print("0.  Exit")
 
     sChoice = input("Select an option: ").strip()
 
     if sChoice == "1":
-        sInput = input("organization_id expression (e.g., (12345678912345 OR 12354678912345) AND 12364578912345): ").strip()
-        tExpr = compileExpr(sInput, isValidOrgId14, "Invalid organization_id in expression. Each must be 14 digits.", bLower=False)
-        mergeExpr(aOrgExprs, tExpr, "Organization filter", "org")
+        addDropdownAtom("Analyst filter", FIELD_IDS["Analyst"], "analyst expression (e.g., analyst1 OR analyst2): ")
     elif sChoice == "2":
-        sInput = input("recipient expression (email; e.g., a@b.com OR c@d.com): ").strip()
-        tExpr = compileExpr(sInput, isValidEmail, "Invalid recipient email in expression.", bLower=True)
-        mergeExpr(aRecipientExprs, tExpr, "Recipient filter", "recipient")
+        addStdAssigneeAtom()
     elif sChoice == "3":
-        sInput = input("requester_id expression (digits; e.g., 1 OR 2 OR 3): ").strip()
-        tExpr = compileExpr(sInput, isValidId, "Invalid requester_id in expression. Use digits only.", bLower=False)
-        mergeExpr(aRequesterIdExprs, tExpr, "Requester ID filter", "requester")
+        addStdGroupAtom()
     elif sChoice == "4":
-        sInput = input("submitter_id expression (digits): ").strip()
-        tExpr = compileExpr(sInput, isValidId, "Invalid submitter_id in expression. Use digits only.", bLower=False)
-        mergeExpr(aSubmitterIdExprs, tExpr, "Submitter ID filter", "submitter")
+        addDropdownAtom("Severity/Impact filter", FIELD_IDS["SeverityImpact"], "severity/impact expression (e.g., high OR critical): ")
     elif sChoice == "5":
-        sInput = input("status expression (new|open|pending|hold|solved|closed; e.g., open OR pending): ").strip()
-        tExpr = compileExpr(sInput, isValidStatus, "Invalid status in expression.", bLower=True)
-        mergeExpr(aStatusExprs, tExpr, "Status filter", "status")
+        addStdStatusAtom()
     elif sChoice == "6":
-        sInput = input("result_type expression (e.g., ticket OR user): ").strip()
-        tExpr = compileExpr(sInput, isValidResultType, "Invalid result_type in expression.", bLower=True)
-        mergeExpr(aResultTypeExprs, tExpr, "Result Type filter", "result_type")
+        addTagsAtom()
     elif sChoice == "7":
-        sInput = input("subject expression (contains; e.g., (urgent OR escalation) AND outage): ").strip()
-        tExpr = compileExpr(sInput, isValidSubject, "Invalid subject value in expression. Each must be 1-200 characters.", bLower=True)
-        mergeExpr(aSubjectExprs, tExpr, "Subject filter", "subject")
+        addStdTypeAtom()
     elif sChoice == "8":
-        sInput = input("description expression (contains; e.g., (error OR failure) AND timeout): ").strip()
-        tExpr = compileExpr(sInput, isValidDescription, "Invalid description value in expression. Each must be 1-200 characters.", bLower=True)
-        mergeExpr(aDescriptionExprs, tExpr, "Description filter", "description")
+        addDropdownAtom("Site filter", FIELD_IDS["Site"], "site expression (e.g., hq OR dc1): ")
     elif sChoice == "9":
-        sStart, sEnd = promptDateRange()
-        def fPred(dT, a=(sStart, sEnd)):
-            sCreated = dT.get("created_at")
-            if not isinstance(sCreated, str) or "T" not in sCreated:
-                return False
-            sDate = sCreated.split("T")[0]
-            return a[0] <= sDate <= a[1]
-        addAtomWithMerge("Created_at date range filter", f'(created_at_date between "{sStart}" and "{sEnd}")', fPred)
+        addDropdownAtom("Classification filter", FIELD_IDS["Classification"], "classification expression (e.g., phishing OR malware): ")
+        addDropdownAtom("Sub-Class filter", FIELD_IDS["SubClass"], "sub-class expression (e.g., credential_theft OR c2): ")
     elif sChoice == "10":
-        sStart, sEnd = promptTimeRange()
-        def fPred(dT, a=(sStart, sEnd)):
-            sCreated = dT.get("created_at")
-            if not isinstance(sCreated, str) or "T" not in sCreated:
-                return False
-            sTime = sCreated.split("T")[1]
-            return a[0] <= sTime <= a[1]
-        addAtomWithMerge("Created_at time range filter", f'(created_at_time between "{sStart}" and "{sEnd}")', fPred)
+        addContainsAtom("Detection/Threat Name filter", FIELD_IDS["DetectionThreatName"], "detection/threat name expression (contains): ")
     elif sChoice == "11":
-        sStart, sEnd = promptDateRange()
-        def fPred(dT, a=(sStart, sEnd)):
-            sUpdated = dT.get("updated_at")
-            if not isinstance(sUpdated, str) or "T" not in sUpdated:
-                return False
-            sDate = sUpdated.split("T")[0]
-            return a[0] <= sDate <= a[1]
-        addAtomWithMerge("Updated_at date range filter", f'(updated_at_date between "{sStart}" and "{sEnd}")', fPred)
+        addContainsAtom("Username filter", FIELD_IDS["Username"], "username expression (contains): ")
     elif sChoice == "12":
-        sStart, sEnd = promptTimeRange()
-        def fPred(dT, a=(sStart, sEnd)):
-            sUpdated = dT.get("updated_at")
-            if not isinstance(sUpdated, str) or "T" not in sUpdated:
-                return False
-            sTime = sUpdated.split("T")[1]
-            return a[0] <= sTime <= a[1]
-        addAtomWithMerge("Updated_at time range filter", f'(updated_at_time between "{sStart}" and "{sEnd}")', fPred)
+        addIPv4Atom("Source IP filter", FIELD_IDS["SourceIp"], "source ip expression (IPv4; e.g., 10.1.2.3 OR 203.0.113.10): ")
     elif sChoice == "13":
-        sStart, sEnd = promptDateRange()
-        def fPred(dT, a=(sStart, sEnd)):
-            sDue = dT.get("due_at")
-            if not isinstance(sDue, str) or "T" not in sDue:
-                return False
-            sDate = sDue.split("T")[0]
-            return a[0] <= sDate <= a[1]
-        addAtomWithMerge("Due_at date range filter", f'(due_at_date between "{sStart}" and "{sEnd}")', fPred)
+        addIPv4Atom("Destination IP filter", FIELD_IDS["DestinationIp"], "destination ip expression (IPv4; e.g., 10.1.2.3 OR 203.0.113.10): ")
     elif sChoice == "14":
-        sStart, sEnd = promptTimeRange()
-        def fPred(dT, a=(sStart, sEnd)):
-            sDue = dT.get("due_at")
-            if not isinstance(sDue, str) or "T" not in sDue:
-                return False
-            sTime = sDue.split("T")[1]
-            return a[0] <= sTime <= a[1]
-        addAtomWithMerge("Due_at time range filter", f'(due_at_time between "{sStart}" and "{sEnd}")', fPred)
+        addHashAtom("File Hash filter", FIELD_IDS["FileHash"], "file hash expression (MD5/SHA1/SHA256; e.g., abc... OR def...): ")
     elif sChoice == "15":
-        print("Proposition: " + formatProposition())
+        addContainsAtom("URL/Website filter", FIELD_IDS["UrlWebsite"], "url/website expression (contains): ")
     elif sChoice == "16":
+        addStdSubjectAtom()
+    elif sChoice == "17":
+        addStdDescriptionAtom()
+    elif sChoice == "18":
+        addContainsAtom("Analyst Notes filter", FIELD_IDS["AnalystNotes"], "analyst notes expression (contains): ")
+    elif sChoice == "19":
+        addDateTimeRangeAtom("Initial Response Time", FIELD_IDS["InitialResponseTime"])
+    elif sChoice == "20":
+        addDateTimeRangeAtom("Recommendation Time", FIELD_IDS["RecommendationTime"])
+    elif sChoice == "21":
+        print("Proposition: " + formatProposition())
+    elif sChoice == "22":
         break
     elif sChoice == "0":
         sys.exit(0)
