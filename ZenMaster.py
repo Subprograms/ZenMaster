@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
 import os, sys, requests, csv, datetime, json, re, time, urllib.parse
+from zoneinfo import ZoneInfo
 
 # Loop prompt for a path to the env file for API calls
 sScriptDir = os.path.dirname(os.path.abspath(__file__))
@@ -117,111 +118,125 @@ if not isinstance(dMe, dict) or "user" not in dMe or "id" not in dMe["user"]:
     sys.exit(1)
 nMyId = dMe["user"]["id"]
 
-# Ticket collectors that tag each ticket with its role (assigned / cc / follower / requester)
-def harvestTickets(sRoleLabel, sStartUrl):
-    global aTicketList, nBatchIndex, nTotalWritten
-    sPage = sStartUrl
-    while sPage:
-        dJ = httpGetJson(sPage)
-        for dT in dJ.get("tickets", []):
-            dT["_role"] = sRoleLabel # stamp the role (internal only)
-            aTicketList.append(dT)
-            if len(aTicketList) >= 100:
-                nTotalWritten += flushBatch()
-        sPage = sNextLink(dJ)
-    return
+def minutesOfDay(oDt):
+    return oDt.hour * 60 + oDt.minute
 
-def harvestSearch(sRoleLabel, sQuery):
-    global aTicketList, nBatchIndex, nTotalWritten
-    sEncoded = urllib.parse.quote(sQuery, safe=":+")
-    sPage = f"{sZendeskBaseUrl}/api/v2/search.json?query={sEncoded}&per_page=100"
-    while sPage:
-        dJ = httpGetJson(sPage)
-        for dHit in dJ.get("results", []):
-            if dHit.get("result_type") == "ticket":
-                dHit["_role"] = sRoleLabel # stamp the role (internal only)
-                aTicketList.append(dHit)
-                if len(aTicketList) >= 100:
-                    nTotalWritten += flushBatch()
-        sPage = sNextLink(dJ)
-    return
+def parseTime12h(sVal):
+    try:
+        return datetime.datetime.strptime(sVal.strip(), "%I:%M %p").time()
+    except Exception:
+        return None
 
-# -----------------------------
-# Filtering Options
-# -----------------------------
-org_filter = None
-time_start_filter = None
-time_end_filter = None
-date_start_filter = None
-date_end_filter = None
+def inWindow(nMin, tStart, tEnd, bWrap):
+    if bWrap:
+        return (nMin >= tStart) or (nMin < tEnd)
+    else:
+        return (nMin >= tStart) and (nMin < tEnd)
 
-recipient_filter = None
-requester_id_filter = None
-result_type_filter = None
-status_filter = None
-subject_filter = None
-submitter_id_filter = None
+def currentManilaShift():
+    oNowPH = datetime.datetime.now(ZoneInfo("Asia/Manila"))
+    nNow = minutesOfDay(oNowPH)
+    # morning 06:30-18:30 (no wrap)
+    # afternoon 01:30-13:30 (no wrap)
+    # evening 21:30-09:30 (wrap)
+    if inWindow(nNow, 6*60+30, 18*60+30, False):
+        return "morning"
+    if inWindow(nNow, 1*60+30, 13*60+30, False):
+        return "afternoon"
+    if inWindow(nNow, 21*60+30, 9*60+30, True):
+        return "evening"
+    return None
 
-# Per-field compiled boolean expressions (list of tuples: (original_str, rpn_tokens))
-aOrgExprs = []
-aRecipientExprs = []
-aRequesterIdExprs = []
-aResultTypeExprs = []
-aStatusExprs = []
-aSubjectExprs = []
-aSubmitterIdExprs = []
-aDescriptionExprs = []
+def shiftOfTime(sTime):
+    oT = parseTime12h(sTime)
+    if not oT:
+        return None
+    nMin = oT.hour*60 + oT.minute
+    if inWindow(nMin, 6*60+30, 18*60+30, False):
+        return "morning"
+    if inWindow(nMin, 1*60+30, 13*60+30, False):
+        return "afternoon"
+    if inWindow(nMin, 21*60+30, 9*60+30, True):
+        return "evening"
+    return None
 
-# Time/date ranges with per-field logic (AND/OR within field)
-aTimeRanges = []
-aDateRanges = []
-sCreatedAtTimeLogic = "OR"
-sCreatedAtDateLogic = "OR"
+def shiftToWindows(sShift):
+    if sShift == "morning":
+        return [(6*60+30, 18*60+30, False)]
+    if sShift == "afternoon":
+        return [(1*60+30, 13*60+30, False)]
+    if sShift == "evening":
+        return [(21*60+30, 9*60+30, True)]
+    return []
 
-# Added: updated_at and due_at filters (time and date)
-aUpdatedTimeRanges = []
-aUpdatedDateRanges = []
-sUpdatedAtTimeLogic = "OR"
-sUpdatedAtDateLogic = "OR"
+def parseDateExpr(sInput):
+    s = sInput.strip()
+    if not s:
+        return []
+    aParts = [p.strip() for p in s.split("OR")]
+    aRanges = []
+    for p in aParts:
+        if "TO" not in p:
+            return None
+        a = [q.strip() for q in p.split("TO")]
+        if len(a)!=2:
+            return None
+        try:
+            d0 = datetime.date.fromisoformat(a[0])
+            d1 = datetime.date.fromisoformat(a[1])
+        except Exception:
+            return None
+        if d0 > d1:
+            return None
+        aRanges.append((d0.isoformat(), d1.isoformat()))
+    return aRanges
 
-aDueTimeRanges = []
-aDueDateRanges = []
-sDueAtTimeLogic = "OR"
-sDueAtDateLogic = "OR"
+def parseTimeExpr(sInput):
+    s = (sInput or "").strip()
+    if not s:
+        sh = currentManilaShift()
+        if not sh:
+            return None, "Current Manila time is outside defined shifts."
+        return [sh], None
+    if "OR" in s:
+        t1, t2 = [q.strip() for q in s.split("OR", 1)]
+        sh1 = shiftOfTime(t1)
+        sh2 = shiftOfTime(t2)
+        if not sh1 or not sh2:
+            return None, "Invalid time format. Use HH:MM AM/PM or HH:MM AM/PM OR HH:MM AM/PM."
+        aOut = []
+        for sh in [sh1, sh2]:
+            if sh not in aOut:
+                aOut.append(sh)
+        return aOut, None
+    else:
+        sh = shiftOfTime(s)
+        if not sh:
+            return None, "Invalid time format. Use HH:MM AM/PM."
+        return [sh], None
 
-def isValidEmail(sVal):
-    if not isinstance(sVal, str):
-        return False
-    if not (1 <= len(sVal) <= 254):
-        return False
-    return re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", sVal) is not None
+def compileExpr(sInput, fValidator, sErr, bLower=False):
+    if not isinstance(sInput, str) or not sInput.strip():
+        print(sErr)
+        return None
+    sNorm = re.sub(r"\s+", " ", sInput.strip())
+    try:
+        aTokens = tokenizeExpr(sNorm)
+        aTokensNorm = []
+        for t in aTokens:
+            if isinstance(t, tuple) and t[0] == "VAL":
+                v = t[1].lower() if bLower else t[1]
+                aTokensNorm.append(("VAL", v))
+            else:
+                aTokensNorm.append(t)
+        if not validateExprTokens(aTokensNorm, fValidator, sErr):
+            return None
+        aRpn = toRpn(aTokensNorm)
+        return (sNorm, aRpn)
+    except Exception as e:
+        print("Invalid expression. Use values with AND/OR and parentheses.")
+        return None
 
-def isValidId(sVal):
-    return isinstance(sVal, str) and re.fullmatch(r"\d+", sVal) is not None
-
-def isValidOrgId14(sVal):
-    return isinstance(sVal, str) and re.fullmatch(r"\d{14}", sVal) is not None
-
-def isValidStatus(sVal):
-    return isinstance(sVal, str) and sVal.lower() in {"new","open","pending","hold","solved","closed"}
-
-def isValidResultType(sVal):
-    return isinstance(sVal, str) and sVal.lower() in {"ticket","user","organization","group","comment","article","entry"}
-
-def isValidSubject(sVal):
-    return isinstance(sVal, str) and 1 <= len(sVal) <= 200
-
-def isValidDescription(sVal):
-    return isinstance(sVal, str) and 1 <= len(sVal) <= 200
-
-def chooseListMergeMode(sWhat, nCount):
-    while True:
-        sMode = input(f"{sWhat} currently has {nCount} value(s). Choose: (a) add, (o) overwrite, (k) keep: ").strip().lower()
-        if sMode in ("a","o","k"):
-            return sMode
-        print("Invalid choice. Enter a, o, or k.")
-
-# -------- Boolean Expression Parsing (AND/OR, parentheses) --------
 def tokenizeExpr(sInput):
     aTokens = []
     n = len(sInput)
@@ -290,28 +305,6 @@ def toRpn(aTokens):
         aOut.append(op)
     return aOut
 
-def compileExpr(sInput, fValidator, sErr, bLower=False):
-    if not isinstance(sInput, str) or not sInput.strip():
-        print(sErr)
-        return None
-    sNorm = re.sub(r"\s+", " ", sInput.strip())
-    try:
-        aTokens = tokenizeExpr(sNorm)
-        aTokensNorm = []
-        for t in aTokens:
-            if isinstance(t, tuple) and t[0] == "VAL":
-                v = t[1].lower() if bLower else t[1]
-                aTokensNorm.append(("VAL", v))
-            else:
-                aTokensNorm.append(t)
-        if not validateExprTokens(aTokensNorm, fValidator, sErr):
-            return None
-        aRpn = toRpn(aTokensNorm)
-        return (sNorm, aRpn)
-    except Exception as e:
-        print("Invalid expression. Use values with AND/OR and parentheses.")
-        return None
-
 def evalRpn(aRpn, fMatch):
     aStack = []
     for t in aRpn:
@@ -331,7 +324,15 @@ def evalRpn(aRpn, fMatch):
             return False
     return aStack[-1] if aStack else False
 
-# ---------------- Filtering application ----------------
+def choosePropositionMergeMode(nCount):
+    while True:
+        sMode = input(f"There is an existing filter. Choose: (a) add, (o) overwrite, (k) keep: ").strip().lower()
+        if sMode in ("a","o","k"):
+            return sMode
+        print("Invalid choice. Enter a, o, or k.")
+
+aAtoms = []
+
 def applyFilters(aTickets):
     if not aAtoms:
         return aTickets
@@ -355,45 +356,13 @@ def formatProposition():
         sOut += " " + tAtom["op"] + " " + tAtom["desc"]
     return sOut
 
-def promptTimeRange():
-    while True:
-        sStart = input("Start time (HH:MM:SSZ): ").strip()
-        sEnd = input("End time (HH:MM:SSZ): ").strip()
-        if not (re.fullmatch(r"\d{2}:\d{2}:\d{2}Z", sStart) and re.fullmatch(r"\d{2}:\d{2}:\d{2}Z", sEnd)):
-            print("Invalid time format, must match HH:MM:SSZ (example: 02:52:31Z).")
-            continue
-        if sStart > sEnd:
-            print("Start time must be less than or equal to end time.")
-            continue
-        return (sStart, sEnd)
+def dtFromString_Ymd12h(sVal):
+    try:
+        return datetime.datetime.strptime(sVal, "%Y/%m/%d %I:%M %p")
+    except Exception:
+        return None
 
-def promptDateRange():
-    while True:
-        sStart = input("Start date (YYYY-MM-DD): ").strip()
-        sEnd = input("End date (YYYY-MM-DD): ").strip()
-        if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", sStart) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", sEnd)):
-            print("Invalid date format, must match YYYY-MM-DD (example: 2025-07-31).")
-            continue
-        if sStart > sEnd:
-            print("Start date must be less than or equal to end date.")
-            continue
-        return (sStart, sEnd)
-
-def chooseExprLogicOnce(sFieldName):
-    while True:
-        s = input(f"Combine with existing filters using (AND/OR): ").strip().upper()
-        if s in ("AND", "OR"):
-            return s
-        print("Invalid logic. Choose AND or OR.")
-
-def choosePropositionMergeMode(nCount):
-    while True:
-        sMode = input(f"There is an existing filter. Choose: (a) add, (o) overwrite, (k) keep: ").strip().lower()
-        if sMode in ("a","o","k"):
-            return sMode
-        print("Invalid choice. Enter a, o, or k.")
-
-def addAtomWithMerge(sWhat, sDesc, fPred):
+def addAtom_OR(sDesc, fPred):
     global aAtoms
     if aAtoms:
         sMode = choosePropositionMergeMode(len(aAtoms))
@@ -404,67 +373,194 @@ def addAtomWithMerge(sWhat, sDesc, fPred):
         if sMode == "o":
             aAtoms = []
             aAtoms.append({"op": None, "desc": sDesc, "pred": fPred})
-            print("Filter set/updated.")
+            print("Date/Time filter set.")
             print("Proposition: " + formatProposition())
             return
-        sOp = chooseExprLogicOnce(sWhat)
-        aAtoms.append({"op": sOp, "desc": sDesc, "pred": fPred})
+        aAtoms.append({"op": "OR", "desc": sDesc, "pred": fPred})
     else:
         aAtoms.append({"op": None, "desc": sDesc, "pred": fPred})
-    print("Filter set/updated.")
+    print("Date/Time filter set.")
     print("Proposition: " + formatProposition())
 
-def mergeExpr(aList, tExpr, sWhat, sFieldKey):
-    if tExpr is None:
+def setDateTimeFilter():
+    print("Date expression using ranges and AND/OR (Optional), sample:")
+    print("2025-01-01 TO 2025-01-10 OR 2025-02-01 TO 2025-02-05")
+    sDateExpr = input("> ").strip()
+    aDateRanges = parseDateExpr(sDateExpr) if sDateExpr else []
+    if aDateRanges is None:
+        print("Invalid date expression.")
         return
-    aList.append(tExpr)
-    sExpr, aRpn = tExpr
-    if sFieldKey == "org":
-        def fPred(dT, a=aRpn):
-            return evalRpn(a, lambda v: str(dT.get("organization_id")) == v)
-        addAtomWithMerge(sWhat, "(" + sExpr + ")", fPred)
-    elif sFieldKey == "recipient":
-        def fPred(dT, a=aRpn):
-            return evalRpn(a, lambda v: str(dT.get("recipient") or "").lower() == v)
-        addAtomWithMerge(sWhat, "(" + sExpr + ")", fPred)
-    elif sFieldKey == "requester":
-        def fPred(dT, a=aRpn):
-            return evalRpn(a, lambda v: str(dT.get("requester_id")) == v)
-        addAtomWithMerge(sWhat, "(" + sExpr + ")", fPred)
-    elif sFieldKey == "result_type":
-        def fPred(dT, a=aRpn):
-            return evalRpn(a, lambda v: str(dT.get("result_type") or "").lower() == v)
-        addAtomWithMerge(sWhat, "(" + sExpr + ")", fPred)
-    elif sFieldKey == "status":
-        def fPred(dT, a=aRpn):
-            return evalRpn(a, lambda v: str(dT.get("status") or "").lower() == v)
-        addAtomWithMerge(sWhat, "(" + sExpr + ")", fPred)
-    elif sFieldKey == "subject":
-        def fPred(dT, a=aRpn):
-            return evalRpn(a, lambda v: v in str(dT.get("subject") or "").lower())
-        addAtomWithMerge(sWhat, "(" + sExpr + ")", fPred)
-    elif sFieldKey == "description":
-        def fPred(dT, a=aRpn):
-            return evalRpn(a, lambda v: v in str(dT.get("description") or "").lower())
-        addAtomWithMerge(sWhat, "(" + sExpr + ")", fPred)
-    elif sFieldKey == "submitter":
-        def fPred(dT, a=aRpn):
-            return evalRpn(a, lambda v: str(dT.get("submitter_id")) == v)
-        addAtomWithMerge(sWhat, "(" + sExpr + ")", fPred)
+    print("Time expression (single time or OR two times). Leave blank to use current Manila time.")
+    print("Samples:")
+    print("03:15 PM")
+    print("03:15 PM OR 10:00 AM")
+    sTimeExpr = input("> ").strip()
+    aShifts, sErr = parseTimeExpr(sTimeExpr)
+    if sTimeExpr=="" and sDateExpr=="":
+        addAtom_OR("(all tickets)", lambda dT: True)
+        return
+    if sErr:
+        print(sErr)
+        if not aDateRanges:
+            return
+        aShifts = None
+    def predDate(dT, a=aDateRanges):
+        if not a:
+            return True
+        sCreated = dT.get("created_at")
+        if not isinstance(sCreated, str) or "T" not in sCreated:
+            return False
+        sDate = sCreated.split("T")[0]
+        for (s0, s1) in a:
+            if s0 <= sDate <= s1:
+                return True
+        return False
+    def predTime(dT, aSh=aShifts):
+        if not aSh:
+            return True
+        sCreated = dT.get("created_at")
+        if not isinstance(sCreated, str) or "T" not in sCreated:
+            return False
+        sTime = sCreated.split("T")[1]
+        try:
+            h, m, rest = sTime.split(":")
+            sec = rest[:2]
+            nMin = int(h)*60 + int(m)
+        except Exception:
+            return False
+        for sh in aSh:
+            for (st, en, wrap) in shiftToWindows(sh):
+                if inWindow(nMin, st, en, wrap):
+                    return True
+        return False
+    def fPred(dT):
+        return predDate(dT) and predTime(dT)
+    sDescParts = []
+    if aDateRanges:
+        sDescParts.append("(" + " OR ".join([f"{a[0]} TO {a[1]}" for a in aDateRanges]) + ")")
+    if aShifts:
+        sDescParts.append("(" + " OR ".join(aShifts) + ")")
+    if not sDescParts:
+        sDescParts.append("(all tickets)")
+    sDesc = " AND ".join(sDescParts)
+    addAtom_OR(sDesc, fPred)
 
-aAtoms = []
+FIELD_IDS = [
+    900012377866, 900012444286, 14398053308057, 900013268543, 900013268523,
+    900012385686, 900003199086, 900012385666, 1900001153468, 900000226446,
+    1900001195968, 38672189313049, 900000247523, 900012385646, 19324908979225,
+    900000226346, 19311219921561, 900012385626, 30141928341401, 30142024427545,
+    900013261823, 1900001153268, 1900001166188, 900013268763, 900000226426,
+    900012377846, 900012222846, 19278963058329, 19278922735769, 39525749101977,
+    13762197131289, 35129962423321, 19278870990489, 19324776789657, 13762198754329,
+    900012377626, 900011598866, 1900001153508, 1900001165728, 35130014125081,
+    19278953511833, 900012399506, 900013284083, 900006185143, 1900001147108,
+    900013268743, 900013268723, 1900001153228, 900000226366, 1900001147088,
+    900000226326, 40814595742361, 900000452426, 900000226386, 900000623723,
+    900013268923, 1900001153248, 26741419461785, 26739092941337, 26840523075609,
+    26741958410393, 26738427296153, 26741776115865, 26838873374873, 26741944262681,
+    26838913059353
+]
 
-# -----------------------------
-# Main Menu Loop
-# -----------------------------
-def isValidIPv4(sVal):
-    return isinstance(sVal, str) and re.fullmatch(r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}", sVal) is not None
+CSV_HEADERS = [
+    "ID",
+    "Organization",
+    "Field's / Custom Field's ID",
+    "Action By Tool",
+    "Action Taken",
+    "Affected Asset",
+    "Affected Asset [Delivered/Non-Remediated]",
+    "Affected Asset [Quarantined/Remediated]",
+    "Agent Name",
+    "Analyst",
+    "Analyst Notes",
+    "Appliance Name",
+    "Assignee",
+    "Campaign",
+    "Checker/Containment Action",
+    "Classification",
+    "Client/Action Response",
+    "Closure Code",
+    "Description",
+    "Destination IP Address",
+    "Destination URL",
+    "Destination Website",
+    "Detection/Threat Name",
+    "Device Name/Serial Number",
+    "File Hash",
+    "File Name and Path",
+    "Group",
+    "Incident Evaluation",
+    "Initial Response Time (YYYY/MM/DD HH:MM AM/PM)",
+    "Linked Issues",
+    "Opened by",
+    "Overview",
+    "Parent Image/Process",
+    "Pending Action [(OWNER) Action]",
+    "Pending Reason",
+    "Problem Owner",
+    "Process / Commandline",
+    "Recommendation Time (YYYY/MM/DD HH:MM AM/PM)",
+    "Reference Numbers",
+    "Request Sub-Type",
+    "Requestor",
+    "Resolution Reason [(MM/DD) Reason]",
+    "Root Cause",
+    "Sender Address [Header From]",
+    "Sender Address [SMTP]",
+    "Severity/Impact",
+    "Site",
+    "Source Country",
+    "Source Host Name",
+    "Source IP Address",
+    "Status",
+    "Sub-Class",
+    "Subject",
+    "Tags",
+    "Ticket Type",
+    "Type",
+    "Urgency",
+    "URL/Website",
+    "Username",
+    "~Classification",
+    "~Detections (K)",
+    "~Detections (New)",
+    "~Incident Validation",
+    "~Mitre Att&ck Tactics and Techniques",
+    "~Sub-Class (K)",
+    "~Sub-Class (New)",
+    "~Threat Name (K)",
+    "~Threat Name (New)"
+]
 
-def isValidHash(sVal):
-    return isinstance(sVal, str) and re.fullmatch(r"(?i)^[a-f0-9]{32}$|^[a-f0-9]{40}$|^[a-f0-9]{64}$", sVal) is not None
+FIELD_NAME_MAP = [
+    "Action By Tool","Action Taken","Affected Asset","Affected Asset [Delivered/Non-Remediated]",
+    "Affected Asset [Quarantined/Remediated]","Agent Name","Analyst","Analyst Notes","Appliance Name",
+    "Assignee","Campaign","Checker/Containment Action","Classification","Client/Action Response","Closure Code",
+    "Description","Destination IP Address","Destination URL","Destination Website","Detection/Threat Name",
+    "Device Name/Serial Number","File Hash","File Name and Path","Group","Incident Evaluation",
+    "Initial Response Time (YYYY/MM/DD HH:MM AM/PM)","Linked Issues","Opened by","Overview","Parent Image/Process",
+    "Pending Action [(OWNER) Action]","Pending Reason","Problem Owner","Process / Commandline",
+    "Recommendation Time (YYYY/MM/DD HH:MM AM/PM)","Reference Numbers","Request Sub-Type","Requestor",
+    "Resolution Reason [(MM/DD) Reason]","Root Cause","Sender Address [Header From]","Sender Address [SMTP]",
+    "Severity/Impact","Site","Source Country","Source Host Name","Source IP Address","Status","Sub-Class","Subject",
+    "Tags","Ticket Type","Type","Urgency","URL/Website","Username","~Classification","~Detections (K)",
+    "~Detections (New)","~Incident Validation","~Mitre Att&ck Tactics and Techniques","~Sub-Class (K)","~Sub-Class (New)",
+    "~Threat Name (K)","~Threat Name (New)"
+]
 
-def isValidToken(sVal):
-    return isinstance(sVal, str) and 1 <= len(sVal) <= 100
+STD_FIELD_GETTERS = {
+    "ID": lambda dT: dT.get("id"),
+    "Organization": lambda dT: dT.get("organization_id"),
+    "Assignee": lambda dT: dT.get("assignee_id"),
+    "Group": lambda dT: dT.get("group_id"),
+    "Status": lambda dT: dT.get("status"),
+    "Subject": lambda dT: dT.get("subject"),
+    "Type": lambda dT: dT.get("type"),
+    "Description": lambda dT: dT.get("description"),
+    "Tags": lambda dT: ",".join([str(t) for t in (dT.get("tags") or [])]),
+    "Ticket Type": lambda dT: dT.get("type")
+}
 
 def customVal(dT, nId):
     try:
@@ -475,268 +571,58 @@ def customVal(dT, nId):
         return None
     return None
 
-FIELD_IDS = {
-    "Analyst": int(float("9.00003E+11")),
-    "SeverityImpact": int(float("9.00006E+11")),
-    "Site": int(float("1.9E+12")),
-    "Classification": int(float("9E+11")),
-    "SubClass": int(float("1.9E+12")),
-    "DetectionThreatName": int(float("9.00013E+11")),
-    "Username": int(float("1.9E+12")),
-    "SourceIp": int(float("1.9E+12")),
-    "DestinationIp": int(float("9.00012E+11")),
-    "FileHash": int(float("1.9E+12")),
-    "UrlWebsite": int(float("9.00013E+11")),
-    "AnalystNotes": int(float("9.00012E+11")),
-    "InitialResponseTime": int(float("9.00012E+11")),
-    "RecommendationTime": int(float("9.00012E+11")),
-}
-
-def compileTokenExpr(sInput):
-    return compileExpr(sInput, isValidToken, "Invalid value in expression.", bLower=True)
-
-def compileIPv4Expr(sInput):
-    return compileExpr(sInput, isValidIPv4, "Invalid IPv4 address in expression.", bLower=False)
-
-def compileHashExpr(sInput):
-    return compileExpr(sInput, isValidHash, "Invalid hash in expression. Use MD5/SHA1/SHA256 hex.", bLower=True)
-
-def dtFromString_Ymd12h(sVal):
-    try:
-        return datetime.datetime.strptime(sVal, "%Y/%m/%d %I:%M %p")
-    except Exception:
-        return None
-
-def addDropdownAtom(sLabel, nFieldId, sPrompt):
-    sInput = input(sPrompt).strip()
-    tExpr = compileTokenExpr(sInput)
-    if tExpr is None:
-        return
-    sExpr, aRpn = tExpr
-    def fPred(dT, a=aRpn, nid=nFieldId):
-        v = str(customVal(dT, nid) or "").lower()
-        return evalRpn(a, lambda tok: v == tok)
-    addAtomWithMerge(sLabel, "(" + sExpr + ")", fPred)
-
-def addContainsAtom(sLabel, nFieldId, sPrompt):
-    sInput = input(sPrompt).strip()
-    tExpr = compileExpr(sInput, isValidDescription, "Invalid value in expression. Each must be 1-200 characters.", bLower=True)
-    if tExpr is None:
-        return
-    sExpr, aRpn = tExpr
-    def fPred(dT, a=aRpn, nid=nFieldId):
-        v = str(customVal(dT, nid) or "").lower()
-        return evalRpn(a, lambda tok: tok in v)
-    addAtomWithMerge(sLabel, "(" + sExpr + ")", fPred)
-
-def addIPv4Atom(sLabel, nFieldId, sPrompt):
-    sInput = input(sPrompt).strip()
-    tExpr = compileIPv4Expr(sInput)
-    if tExpr is None:
-        return
-    sExpr, aRpn = tExpr
-    def fPred(dT, a=aRpn, nid=nFieldId):
-        v = str(customVal(dT, nid) or "")
-        return evalRpn(a, lambda tok: v == tok)
-    addAtomWithMerge(sLabel, "(" + sExpr + ")", fPred)
-
-def addHashAtom(sLabel, nFieldId, sPrompt):
-    sInput = input(sPrompt).strip()
-    tExpr = compileHashExpr(sInput)
-    if tExpr is None:
-        return
-    sExpr, aRpn = tExpr
-    def fPred(dT, a=aRpn, nid=nFieldId):
-        v = str(customVal(dT, nid) or "").lower()
-        return evalRpn(a, lambda tok: v == tok)
-    addAtomWithMerge(sLabel, "(" + sExpr + ")", fPred)
-
-def addTagsAtom():
-    sInput = input("tags expression (e.g., (phishing OR malware) AND vip): ").strip()
-    tExpr = compileTokenExpr(sInput)
-    if tExpr is None:
-        return
-    sExpr, aRpn = tExpr
-    def fPred(dT, a=aRpn):
-        aTags = [str(t).lower() for t in (dT.get("tags") or [])]
-        return evalRpn(a, lambda tok: tok in aTags)
-    addAtomWithMerge("Tags filter", "(" + sExpr + ")", fPred)
-
-def addStdStatusAtom():
-    sInput = input("status expression (new|open|pending|hold|solved|closed; e.g., open OR pending): ").strip()
-    tExpr = compileExpr(sInput, isValidStatus, "Invalid status in expression.", bLower=True)
-    mergeExpr(aStatusExprs, tExpr, "Status filter", "status")
-
-def addStdTypeAtom():
-    sInput = input("type expression (e.g., incident OR problem OR task OR question): ").strip()
-    tExpr = compileTokenExpr(sInput)
-    if tExpr is None:
-        return
-    sExpr, aRpn = tExpr
-    def fPred(dT, a=aRpn):
-        return evalRpn(a, lambda tok: str(dT.get("type") or "").lower() == tok)
-    addAtomWithMerge("Type filter", "(" + sExpr + ")", fPred)
-
-def addStdAssigneeAtom():
-    sInput = input("assignee_id expression (digits; e.g., 12345 OR 67890): ").strip()
-    tExpr = compileExpr(sInput, isValidId, "Invalid assignee_id in expression. Use digits only.", bLower=False)
-    if tExpr is None:
-        return
-    sExpr, aRpn = tExpr
-    def fPred(dT, a=aRpn):
-        return evalRpn(a, lambda tok: str(dT.get("assignee_id") or "") == tok)
-    addAtomWithMerge("Assignee ID filter", "(" + sExpr + ")", fPred)
-
-def addStdGroupAtom():
-    sInput = input("group_id expression (digits; e.g., 111 OR 222): ").strip()
-    tExpr = compileExpr(sInput, isValidId, "Invalid group_id in expression. Use digits only.", bLower=False)
-    if tExpr is None:
-        return
-    sExpr, aRpn = tExpr
-    def fPred(dT, a=aRpn):
-        return evalRpn(a, lambda tok: str(dT.get("group_id") or "") == tok)
-    addAtomWithMerge("Group ID filter", "(" + sExpr + ")", fPred)
-
-def addStdSubjectAtom():
-    sInput = input("subject expression (contains; e.g., (urgent OR escalation) AND outage): ").strip()
-    tExpr = compileExpr(sInput, isValidSubject, "Invalid subject value in expression. Each must be 1-200 characters.", bLower=True)
-    mergeExpr(aSubjectExprs, tExpr, "Subject filter", "subject")
-
-def addStdDescriptionAtom():
-    sInput = input("description expression (contains; e.g., (error OR failure) AND timeout): ").strip()
-    tExpr = compileExpr(sInput, isValidDescription, "Invalid description value in expression. Each must be 1-200 characters.", bLower=True)
-    mergeExpr(aDescriptionExprs, tExpr, "Description filter", "description")
-
-def addDateTimeRangeAtom(sLabel, nFieldId):
-    while True:
-        sStart = input("Start (YYYY/MM/DD HH:MM AM/PM): ").strip()
-        sEnd   = input("End   (YYYY/MM/DD HH:MM AM/PM): ").strip()
-        if not (re.fullmatch(r"\d{4}/\d{2}/\d{2}\s\d{2}:\d{2}\s(?:AM|PM)", sStart) and re.fullmatch(r"\d{4}/\d{2}/\d{2}\s\d{2}:\d{2}\s(?:AM|PM)", sEnd)):
-            print("Invalid datetime format, must match YYYY/MM/DD HH:MM AM/PM (example: 2025/09/10 07:45 PM).")
-            continue
-        oStart = dtFromString_Ymd12h(sStart)
-        oEnd   = dtFromString_Ymd12h(sEnd)
-        if not oStart or not oEnd or oStart > oEnd:
-            print("Start must be <= End.")
-            continue
-        break
-    def fPred(dT, nid=nFieldId, aStart=oStart, aEnd=oEnd):
-        sVal = str(customVal(dT, nid) or "")
-        oVal = dtFromString_Ymd12h(sVal)
-        if not oVal:
-            return False
-        return aStart <= oVal <= aEnd
-    addAtomWithMerge(sLabel, f'({sLabel} between "{sStart}" and "{sEnd}")', fPred)
-
-while True:
-    print("")
-    print("Main Menu")
-    print("1.  Filter by Analyst (drop-down exact match)")
-    print("2.  Filter by Assignee ID")
-    print("3.  Filter by Group ID")
-    print("4.  Filter by Severity/Impact (drop-down)")
-    print("5.  Filter by Status")
-    print("6.  Filter by Tags")
-    print("7.  Filter by Type (ticket type)")
-    print("8.  Filter by Site (drop-down)")
-    print("9.  Filter by Classification/Sub-Class (drop-down)")
-    print("10. Filter by Detection/Threat Name (contains)")
-    print("11. Filter by Username (contains)")
-    print("12. Filter by Source IP Address (IPv4)")
-    print("13. Filter by Destination IP Address (IPv4)")
-    print("14. Filter by File Hash (MD5/SHA1/SHA256)")
-    print("15. Filter by URL/Website (contains)")
-    print("16. Filter by Subject (contains)")
-    print("17. Filter by Description (contains)")
-    print("18. Filter by Analyst Notes (contains)")
-    print("19. Filter by Initial Response Time range (YYYY/MM/DD HH:MM AM/PM)")
-    print("20. Filter by Recommendation Time range (YYYY/MM/DD HH:MM AM/PM)")
-    print("21. Show Current Filter Proposition")
-    print("22. Proceed with Retrieval")
-    print("0.  Exit")
-
-    sChoice = input("Select an option: ").strip()
-
-    if sChoice == "1":
-        addDropdownAtom("Analyst filter", FIELD_IDS["Analyst"], "analyst expression (e.g., analyst1 OR analyst2): ")
-    elif sChoice == "2":
-        addStdAssigneeAtom()
-    elif sChoice == "3":
-        addStdGroupAtom()
-    elif sChoice == "4":
-        addDropdownAtom("Severity/Impact filter", FIELD_IDS["SeverityImpact"], "severity/impact expression (e.g., high OR critical): ")
-    elif sChoice == "5":
-        addStdStatusAtom()
-    elif sChoice == "6":
-        addTagsAtom()
-    elif sChoice == "7":
-        addStdTypeAtom()
-    elif sChoice == "8":
-        addDropdownAtom("Site filter", FIELD_IDS["Site"], "site expression (e.g., hq OR dc1): ")
-    elif sChoice == "9":
-        addDropdownAtom("Classification filter", FIELD_IDS["Classification"], "classification expression (e.g., phishing OR malware): ")
-        addDropdownAtom("Sub-Class filter", FIELD_IDS["SubClass"], "sub-class expression (e.g., credential_theft OR c2): ")
-    elif sChoice == "10":
-        addContainsAtom("Detection/Threat Name filter", FIELD_IDS["DetectionThreatName"], "detection/threat name expression (contains): ")
-    elif sChoice == "11":
-        addContainsAtom("Username filter", FIELD_IDS["Username"], "username expression (contains): ")
-    elif sChoice == "12":
-        addIPv4Atom("Source IP filter", FIELD_IDS["SourceIp"], "source ip expression (IPv4; e.g., 10.1.2.3 OR 203.0.113.10): ")
-    elif sChoice == "13":
-        addIPv4Atom("Destination IP filter", FIELD_IDS["DestinationIp"], "destination ip expression (IPv4; e.g., 10.1.2.3 OR 203.0.113.10): ")
-    elif sChoice == "14":
-        addHashAtom("File Hash filter", FIELD_IDS["FileHash"], "file hash expression (MD5/SHA1/SHA256; e.g., abc... OR def...): ")
-    elif sChoice == "15":
-        addContainsAtom("URL/Website filter", FIELD_IDS["UrlWebsite"], "url/website expression (contains): ")
-    elif sChoice == "16":
-        addStdSubjectAtom()
-    elif sChoice == "17":
-        addStdDescriptionAtom()
-    elif sChoice == "18":
-        addContainsAtom("Analyst Notes filter", FIELD_IDS["AnalystNotes"], "analyst notes expression (contains): ")
-    elif sChoice == "19":
-        addDateTimeRangeAtom("Initial Response Time", FIELD_IDS["InitialResponseTime"])
-    elif sChoice == "20":
-        addDateTimeRangeAtom("Recommendation Time", FIELD_IDS["RecommendationTime"])
-    elif sChoice == "21":
-        print("Proposition: " + formatProposition())
-    elif sChoice == "22":
-        break
-    elif sChoice == "0":
-        sys.exit(0)
-    else:
-        print("Invalid choice, please try again.")
-
-aTicketList = []
-sFileStamp = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
-
 def cellValue(vRaw):
     if vRaw is None:
         return ""
     if isinstance(vRaw, (dict, list)):
-        return json.dumps(vRaw, ensure_ascii=False) # JSON stays JSON
+        return json.dumps(vRaw, ensure_ascii=False)
     if isinstance(vRaw, str):
         return vRaw.replace("\r", " ").replace("\n", " ")
-    return vRaw # numbers / bools untouched
+    return vRaw
+
+def ticketRow(dT):
+    dRow = {}
+    dRow["ID"] = STD_FIELD_GETTERS["ID"](dT)
+    dRow["Organization"] = STD_FIELD_GETTERS["Organization"](dT)
+    aIds = []
+    for cf in (dT.get("custom_fields") or []):
+        try:
+            aIds.append(str(cf.get("id")))
+        except Exception:
+            pass
+    dRow["Field's / Custom Field's ID"] = ",".join(aIds)
+    for sKey in CSV_HEADERS:
+        if sKey in ("ID","Organization","Field's / Custom Field's ID"):
+            continue
+        if sKey in STD_FIELD_GETTERS:
+            dRow[sKey] = STD_FIELD_GETTERS[sKey](dT)
+            continue
+        try:
+            idx = FIELD_NAME_MAP.index(sKey)
+            nFieldId = FIELD_IDS[idx]
+            v = customVal(dT, nFieldId)
+            dRow[sKey] = v
+        except Exception:
+            dRow[sKey] = ""
+    return dRow
 
 def writeBatchFiles(aTickets, nBatchIdx, bWantWorkbook):
     aTicketsSorted = sorted(aTickets, key=lambda d: d.get("id", 0))
-    aColumnNames = sorted({k for dT in aTicketsSorted for k in dT.keys() if not k.startswith("_")})
-    if "id" in aColumnNames:
-        aColumnNames.remove("id")
-    aColumnNames.insert(0, "id")
-    sCsvFileName = f"zendesk_tickets_{sFileStamp}_batch_{nBatchIdx:05d}.csv"
+    oNowPH = datetime.datetime.now(ZoneInfo("Asia/Manila"))
+    sStamp = oNowPH.strftime("%Y%m%d_%I%M%S_%p").lower()
+    sCsvFileName = f"zendesk_tickets_{sStamp}_batch_{nBatchIdx:05d}.csv"
     with open(sCsvFileName, "w", newline="", encoding="utf-8-sig") as hCsv:
         oCsvWriter = csv.DictWriter(
             hCsv,
-            fieldnames=aColumnNames,
+            fieldnames=CSV_HEADERS,
             extrasaction="ignore",
             quoting=csv.QUOTE_ALL,
             lineterminator="\r\n",
         )
         oCsvWriter.writeheader()
         for dT in aTicketsSorted:
-            oCsvWriter.writerow({k: cellValue(dT.get(k)) for k in aColumnNames})
+            dRow = ticketRow(dT)
+            oCsvWriter.writerow({k: cellValue(dRow.get(k)) for k in CSV_HEADERS})
     sWorkbookName = None
     if bWantWorkbook:
         try:
@@ -744,7 +630,7 @@ def writeBatchFiles(aTickets, nBatchIdx, bWantWorkbook):
         except ImportError:
             print("xlsxwriter not installed, skipping workbook.")
         else:
-            sWorkbookName = f"zendesk_tickets_{sFileStamp}_batch_{nBatchIdx:05d}_formatted.xlsx"
+            sWorkbookName = f"zendesk_tickets_{sStamp}_batch_{nBatchIdx:05d}_formatted.xlsx"
             oWb = xlsxwriter.Workbook(sWorkbookName, {"constant_memory": True})
             oWs = oWb.add_worksheet("tickets")
             oFmtSection = oWb.add_format({"bold": True, "align": "center", "valign": "vcenter", "bg_color": "#BDD7EE"})
@@ -755,45 +641,32 @@ def writeBatchFiles(aTickets, nBatchIdx, bWantWorkbook):
             for dT in aTicketsSorted:
                 nTicketId = dT.get("id", "UNKNOWN")
                 sRole     = dT.get("_role", "unknown").upper()
-                oWs.merge_range(nRow, 0, nRow, 1, f"{sRole} - Ticket {nTicketId}", oFmtSection)
+                oWs.merge_range(nRow, 0, nRow, len(CSV_HEADERS)-1, f"{sRole} - Ticket {nTicketId}", oFmtSection)
                 oWs.set_row(nRow, 20)
                 nRow += 1
-                oWs.write(nRow, 0, "Ticket Field", oFmtHead)
-                oWs.write(nRow, 1, "Value",        oFmtHead)
+                for i, col in enumerate(CSV_HEADERS):
+                    oWs.write(nRow, i, col, oFmtHead)
                 oWs.set_row(nRow, 22)
                 nRow += 1
-                for k in aColumnNames:
-                    oWs.write(nRow, 0, k,               oFmtField)
-                    oWs.write(nRow, 1, cellValue(dT.get(k)), oFmtValue)
-                    oWs.set_row(nRow, 35)
-                    nRow += 1
-                nRow += 3
-            oWs.set_column(0, 0, 30,  oFmtField)
-            oWs.set_column(1, 1, 100, oFmtValue)
+                dRow = ticketRow(dT)
+                for i, col in enumerate(CSV_HEADERS):
+                    oWs.write(nRow, i, cellValue(dRow.get(col)), oFmtValue)
+                oWs.set_row(nRow, 20)
+                nRow += 2
+            for i in range(len(CSV_HEADERS)):
+                oWs.set_column(i, i, 28)
             oWb.close()
-    sEnvFileName = f"zendesk_tickets_{sFileStamp}_batch_{nBatchIdx:05d}.env"
-    with open(sEnvFileName, "w", encoding="utf-8") as hEnv:
-        for dT in aTicketsSorted:
-            nId = dT.get("id")
-            if nId is None:
-                continue
-            for k, v in dT.items():
-                if k.startswith("_"):
-                    continue
-                sEnvVar = f'TICKET_{nId}_{re.sub(r"[^A-Za-z0-9]", "_", k).upper()}'
-                hEnv.write(f'{sEnvVar}="{cellValue(v)}"\n')
     print(f"Wrote {len(aTicketsSorted)} tickets -> {sCsvFileName}")
     if bWantWorkbook and sWorkbookName:
         print(f"Wrote formatted workbook -> {sWorkbookName}")
-    print(f"Wrote ticket-variable file -> {sEnvFileName}")
     return len(aTicketsSorted)
 
 def flushBatch():
     global aTicketList, nBatchIndex, bMakeWorkbook
     if not aTicketList:
         return 0
-    aBatch = aTicketList[:100]
-    aTicketList = aTicketList[100:]
+    aBatch = aTicketList[:50]
+    aTicketList = aTicketList[50:]
     aFiltered = applyFilters(aBatch)
     if not aFiltered:
         nBatchIndex += 1
@@ -802,12 +675,61 @@ def flushBatch():
     nBatchIndex += 1
     return nWritten
 
-# CSV for ingestion by Power BI
-# Optional XLSX for formatted tickets as tables
-bMakeWorkbook = input("Save formatted Excel workbook? (y/n): ").strip().lower() == "y"
+def harvestTickets(sRoleLabel, sStartUrl):
+    global aTicketList, nBatchIndex, nTotalWritten
+    sPage = sStartUrl
+    while sPage:
+        dJ = httpGetJson(sPage)
+        for dT in dJ.get("tickets", []):
+            dT["_role"] = sRoleLabel
+            aTicketList.append(dT)
+            if len(aTicketList) >= 50:
+                nTotalWritten += flushBatch()
+        sPage = sNextLink(dJ)
+    return
 
+def harvestSearch(sRoleLabel, sQuery):
+    global aTicketList, nBatchIndex, nTotalWritten
+    sEncoded = urllib.parse.quote(sQuery, safe=":+")
+    sPage = f"{sZendeskBaseUrl}/api/v2/search.json?query={sEncoded}&per_page=100"
+    while sPage:
+        dJ = httpGetJson(sPage)
+        for dHit in dJ.get("results", []):
+            if dHit.get("result_type") == "ticket":
+                dHit["_role"] = sRoleLabel
+                aTicketList.append(dHit)
+                if len(aTicketList) >= 50:
+                    nTotalWritten += flushBatch()
+        sPage = sNextLink(dJ)
+    return
+
+def mainMenu():
+    while True:
+        print("")
+        print("Main Menu")
+        print("1.  Set/Change Date+Time filter")
+        print("2.  Show Current Filter Proposition")
+        print("3.  Proceed with Retrieval")
+        print("0.  Exit")
+        sChoice = input("Select an option: ").strip()
+        if sChoice == "1":
+            setDateTimeFilter()
+        elif sChoice == "2":
+            print("Proposition: " + formatProposition())
+        elif sChoice == "3":
+            break
+        elif sChoice == "0":
+            sys.exit(0)
+        else:
+            print("Invalid choice, please try again.")
+
+mainMenu()
+
+aTicketList = []
 nBatchIndex = 1
 nTotalWritten = 0
+
+bMakeWorkbook = input("Save formatted Excel workbook? (y/n): ").strip().lower() == "y"
 
 harvestTickets("assigned",  f"{sZendeskBaseUrl}/api/v2/tickets.json?page[size]=100")
 harvestSearch("cc",        f"type:ticket+cc:{nMyId}")
@@ -815,5 +737,7 @@ harvestSearch("follower",  f"type:ticket+follower:{nMyId}")
 harvestSearch("requester", f"type:ticket+requester:{nMyId}")
 
 nTotalWritten += flushBatch()
+while aTicketList:
+    nTotalWritten += flushBatch()
 
 print(f"Total tickets written across batches: {nTotalWritten}")
